@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Tuple, Optional
 
 import numpy as np
-import sounddevice as sd
+# 音频输入输出用的 sounddevice，在服务器模式下不一定有 PortAudio
+try:
+    import sounddevice as sd
+except (ImportError, OSError):
+    sd = None
+    print("[Info] sounddevice/PortAudio not available; mic playback disabled on this machine.")
 import soundfile as sf
 import requests
 import websockets
