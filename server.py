@@ -128,6 +128,10 @@ class SpeakResponse(BaseModel):
     transcript: str
     user_transcript: str = ""
     conversation_ended: bool = False
+    # 故事进度（三个核心要素是否已被 Sam 提及）
+    progress_breakup_reason: bool = False
+    progress_move_reason: bool = False
+    progress_future_hope: bool = False
 
 
 # ── 路由 ──────────────────────────────────────────────────────
@@ -230,6 +234,9 @@ async def sam_speak(req: SpeakRequest):
         transcript=transcript,
         user_transcript=user_text or "",
         conversation_ended=ended,
+        progress_breakup_reason=story_progress["breakup_reason"],
+        progress_move_reason=story_progress["move_reason"],
+        progress_future_hope=story_progress["future_hope"],
     )
 
 
