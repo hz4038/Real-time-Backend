@@ -8,6 +8,7 @@ from voice_agent_realtime import (
     ensure_api_key,
     SAMPLE_RATE,
     SAM_INSTRUCTIONS,
+    END_TOKEN,
     transcribe_audio_to_text,
     build_kb,
     build_instructions_with_kb,
@@ -22,6 +23,18 @@ api_key = ensure_api_key()
 kb = build_kb()
 
 
+def extract_end_flag(transcript: str) -> tuple[str, bool]:
+    """
+    检查 transcript 中是否包含 END_TOKEN。
+    如有，则移除该标记并返回 (cleaned_transcript, True)，
+    否则返回 (transcript, False)。
+    """
+    if END_TOKEN in transcript:
+        cleaned = transcript.replace(END_TOKEN, "").strip()
+        return cleaned, True
+    return transcript, False
+
+
 class SpeakRequest(BaseModel):
     # Unity 传来的原始 pcm16 单声道音频，采样率 SAMPLE_RATE (默认 24000)，base64 编码
     audio_pcm16_b64: str
@@ -34,6 +47,8 @@ class SpeakResponse(BaseModel):
     transcript: str
     # 用户这一句说话的识别结果（STT）
     user_transcript: str = ""
+    # Sam 是否主动结束了对话（True = Unity 应触发结束流程）
+    conversation_ended: bool = False
 
 
 @app.get("/sam/greet", response_model=SpeakResponse)
@@ -53,26 +68,29 @@ async def sam_greet():
         instructions=SAM_INSTRUCTIONS,
         user_text=greeting_user_text,
     )
+    transcript, ended = extract_end_flag(transcript or "")
     reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
     return SpeakResponse(
-    reply_pcm16_b64=reply_b64,
-    transcript=transcript or "",
-    user_transcript=""
-)
+        reply_pcm16_b64=reply_b64,
+        transcript=transcript,
+        user_transcript="",
+        conversation_ended=ended,
+    )
 
 
 @app.post("/sam/speak", response_model=SpeakResponse)
 async def sam_speak(req: SpeakRequest):
     """
     完整复刻你在 VS Code 项目里的对话逻辑：
-    1. Unity 把“一句话”的 pcm16 音频发过来（base64）；
+    1. Unity 把"一句话"的 pcm16 音频发过来（base64）；
     2. 后端先用 gpt-4o-mini-transcribe 做 STT → user_text；
     3. 基于 user_text 在外接知识库 KB 里检索，构造增强后的 instructions；
-    4. 再把原始 pcm16 音频交给 Realtime，生成 Sam 的语音回复和字幕。
+    4. 再把原始 pcm16 音频交给 Realtime，生成 Sam 的语音回复和字幕；
+    5. 检测 Sam 回复中是否含有 END_TOKEN，若有则 conversation_ended=True 通知 Unity。
     """
     audio_bytes = base64.b64decode(req.audio_pcm16_b64)
     if not audio_bytes:
-        return SpeakResponse(reply_pcm16_b64="", transcript="")
+        return SpeakResponse(reply_pcm16_b64="", transcript="", conversation_ended=False)
 
     # 转成 float32 [-1, 1]，复用你原脚本里的 transcribe_audio_to_text
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32767.0
@@ -102,11 +120,18 @@ async def sam_speak(req: SpeakRequest):
         return SpeakResponse(
             reply_pcm16_b64="",
             transcript="Sorry, something went wrong while talking to Sam.",
+            conversation_ended=False,
         )
+
+    # 4) 检测并移除 END_TOKEN，决定是否通知 Unity 结束对话
+    transcript, ended = extract_end_flag(transcript or "")
+    if ended:
+        print("[Backend] Sam 决定结束对话，conversation_ended=True")
 
     reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
     return SpeakResponse(
         reply_pcm16_b64=reply_b64,
-        transcript=transcript or "",
-        user_transcript=user_text or ""
+        transcript=transcript,
+        user_transcript=user_text or "",
+        conversation_ended=ended,
     )
