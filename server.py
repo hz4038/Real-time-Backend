@@ -217,16 +217,48 @@ async def sam_speak(req: SpeakRequest):
     # 4) 检测 END_TOKEN（强制告别路径会带这个 token）
     transcript, token_ended = extract_end_flag(transcript)
 
-    # 5) 用 GPT-4o-mini 更新故事进度（异步检测，不阻塞回包）
-    if transcript and not all_story_told():
+    # 5) 用 GPT-4o-mini 更新故事进度
+    was_complete_before = all_story_told()
+    if transcript and not was_complete_before:
         check_story_progress(transcript)
 
+    just_completed = (not was_complete_before) and all_story_told()
+
     # 6) 判断是否结束
-    #    - Sam 在回复里带了 END_TOKEN，说明她说了再见
-    #    - 或者故事刚好在这轮全部讲完（下一轮会被强制告别，这里先不结束）
     ended = token_ended
+
+    # 6b) 若本轮故事刚好全部讲完，立刻让 Sam 当场说再见（不等下一轮用户输入）
+    if just_completed and not ended:
+        print("[Backend] 故事三要素刚全部覆盖，立即触发 Sam 说再见。")
+        try:
+            farewell_instructions = SAM_INSTRUCTIONS + FAREWELL_INSTRUCTION
+            farewell_audio, farewell_transcript = await call_realtime_text_only(
+                api_key=api_key,
+                instructions=farewell_instructions,
+                user_text=(
+                    "The conversation has reached a natural end. "
+                    "Please say a warm goodbye now."
+                ),
+            )
+            farewell_transcript, farewell_ended = extract_end_flag(farewell_transcript or "")
+            ended = True  # 无论有没有 token，这条消息就是结束
+
+            # 把 farewell 的音频和字幕拼到这次回包里一起返回
+            # 两段音频拼接：先播这轮 Sam 的话，再播告别语
+            combined_audio = (audio_reply or b"") + (farewell_audio or b"")
+            combined_transcript = transcript
+            if farewell_transcript:
+                combined_transcript = (transcript + " " + farewell_transcript).strip()
+
+            audio_reply = combined_audio
+            transcript = combined_transcript
+            print(f"[Backend] Farewell transcript: {farewell_transcript}")
+        except Exception as e:
+            print(f"[Backend] 触发告别失败，将在下一轮处理: {e}")
+            ended = False  # 失败了就下一轮再来
+
     if ended:
-        print("[Backend] conversation_ended=True（Sam 说了再见）")
+        print("[Backend] conversation_ended=True")
 
     reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
     return SpeakResponse(
