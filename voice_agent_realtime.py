@@ -367,12 +367,14 @@ async def call_realtime_once(
                 text = item.get("text", "")
                 if not text:
                     continue
+                # user 用 input_text，assistant 用 text（OpenAI Realtime API 规范）
+                content_type = "input_text" if role == "user" else "text"
                 await ws.send(json.dumps({
                     "type": "conversation.item.create",
                     "item": {
                         "type": "message",
                         "role": role,
-                        "content": [{"type": "input_text", "text": text}],
+                        "content": [{"type": content_type, "text": text}],
                     },
                 }))
 
@@ -517,12 +519,14 @@ async def call_realtime_text_only(
                 text = item.get("text", "")
                 if not text:
                     continue
+                # user 用 input_text，assistant 用 text（OpenAI Realtime API 规范）
+                content_type = "input_text" if role == "user" else "text"
                 await ws.send(json.dumps({
                     "type": "conversation.item.create",
                     "item": {
                         "type": "message",
                         "role": role,
-                        "content": [{"type": "input_text", "text": text}],
+                        "content": [{"type": content_type, "text": text}],
                     },
                 }))
 
