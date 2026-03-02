@@ -49,32 +49,71 @@ def all_story_told() -> bool:
     return all(story_progress.values())
 
 
-def check_story_progress(sophia_text: str) -> None:
+def check_story_progress(sophia_text: str, user_text: str = "") -> None:
     """
-    用 GPT-4o-mini 分析 Sophia 刚说的这句话，判断覆盖了哪些故事要素，
-    并更新全局 story_progress。只对还未覆盖的要素做检测。
+    用 GPT-4o-mini 分析本轮对话，判断各故事要素是否达成，并更新全局 story_progress。
+    - basic_situation / inner_conflict：看 Sophia 是否明确说出了相关内容
+    - comforted：看用户是否说了安慰/鼓励的话，且 Sophia 表达了接受/感谢
+    只检测还未完成的要素。
     """
-    # 已经全部讲完就不用再检测了
     pending = [k for k, v in story_progress.items() if not v]
-    if not pending or not sophia_text:
+    if not pending:
         return
 
-    prompt = f"""You are analyzing a line of dialogue spoken by a fictional character named Sophia.
-Sophia is a nurse on a long-distance train, heading back to her hometown to visit a hospitalized family elder.
-She carries a complex mix of pride in her growth and guilt for being away from family for so long.
+    # 构造本轮对话摘要，只传必要的文本
+    this_turn = ""
+    if user_text:
+        this_turn += f'User said: "{user_text}"\n'
+    if sophia_text:
+        this_turn += f'Sophia said: "{sophia_text}"\n'
+    if not this_turn.strip():
+        return
 
-Sophia just said:
-"{sophia_text}"
+    # 只检测还未完成的要素，减少误判
+    checks = []
+    rules = []
+    if "basic_situation" in pending:
+        checks.append("basic_situation")
+        rules.append(
+            "basic_situation — Answer YES only if Sophia has EXPLICITLY stated ALL THREE of the following in this or previous turns:\n"
+            "  (a) she works as a nurse (or in the medical field) in a city\n"
+            "  (b) she is currently on a train heading back to her hometown\n"
+            "  (c) the reason is to visit a sick/hospitalized family member\n"
+            "  If any of the three is missing or only vaguely hinted at, answer NO."
+        )
+    if "inner_conflict" in pending:
+        checks.append("inner_conflict")
+        rules.append(
+            "inner_conflict — Answer YES only if Sophia has CLEARLY expressed an internal emotional struggle, such as:\n"
+            "  feeling guilty or regretful for being away from family for years, or\n"
+            "  feeling torn between her career in the city and her responsibilities to family, or\n"
+            "  expressing that she has missed important family moments and carries that weight.\n"
+            "  A passing mention of being tired or missing home is NOT enough. The conflict must be emotionally explicit. If uncertain, answer NO."
+        )
+    if "comforted" in pending:
+        checks.append("comforted")
+        rules.append(
+            "comforted — Answer YES only if BOTH of the following are true:\n"
+            "  (a) The USER said something genuinely supportive, encouraging, or empathetic toward Sophia's situation (not just a neutral reply or a question)\n"
+            "  (b) Sophia's reply shows she received that comfort — e.g. she thanks the user, says she feels better/lighter, or expresses that talking helped.\n"
+            "  If the user said nothing comforting, or Sophia did not respond with gratitude/relief, answer NO."
+        )
 
-For each item below, answer only "yes" or "no" (lowercase, no punctuation):
-1. basic_situation — Has Sophia shared her basic background? (e.g. she is a nurse, she works in the city, she is on this train to visit a sick family member)
-2. inner_conflict — Has Sophia revealed her inner conflict or emotional tension? (e.g. feeling guilty for being away, torn between career and family, missing important family moments)
-3. comforted — Has Sophia expressed that she feels comforted, understood, or emotionally supported by the user? (e.g. thanking the user, saying she feels better, feeling less alone)
+    rules_text = "\n\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
+    keys_format = "\n".join(f"{k}: yes/no" for k in checks)
 
-Reply in this exact format (one per line):
-basic_situation: yes/no
-inner_conflict: yes/no
-comforted: yes/no"""
+    prompt = f"""You are a strict story-progress checker for a narrative game.
+A fictional character named Sophia (a nurse on a train visiting a sick family elder) is having a conversation with the player.
+
+Here is what happened in THIS turn:
+{this_turn.strip()}
+
+Evaluate ONLY the following criteria. Apply the rules strictly — when in doubt, answer "no".
+
+{rules_text}
+
+Reply ONLY in this exact format, one line per criterion, no extra text:
+{keys_format}"""
 
     try:
         resp = http_requests.post(
@@ -83,19 +122,19 @@ comforted: yes/no"""
             json={
                 "model": "gpt-4o-mini",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 60,
+                "max_tokens": 40,
                 "temperature": 0,
             },
             timeout=10,
         )
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"].strip()
-        print(f"[StoryCheck] Sophia said: {sophia_text[:80]}...")
+        print(f"[StoryCheck] This turn — User: '{user_text[:60]}' | Sophia: '{sophia_text[:60]}'")
         print(f"[StoryCheck] GPT-4o-mini result:\n{result}")
 
         for line in result.splitlines():
             line = line.strip().lower()
-            for key in story_progress:
+            for key in checks:
                 if line.startswith(key + ":") and "yes" in line:
                     if not story_progress[key]:
                         story_progress[key] = True
@@ -235,10 +274,10 @@ async def sophia_speak(req: SpeakRequest):
 
     transcript, token_ended = extract_end_flag(transcript)
 
-    # 5) 用 GPT-4o-mini 更新故事进度
+    # 5) 用 GPT-4o-mini 更新故事进度（同时传入用户这句话，comforted 需要两方确认）
     was_complete_before = all_story_told()
     if transcript and not was_complete_before:
-        check_story_progress(transcript)  # 传入 Sophia 的回复文本
+        check_story_progress(transcript, user_text or "")
 
     just_completed = (not was_complete_before) and all_story_told()
 
