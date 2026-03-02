@@ -29,7 +29,7 @@ SILENCE_SECONDS = 2.0
 ENERGY_THRESHOLD = 0.005  # 语音能量阈值，可根据环境调整
 
 # Realtime 模型与 WebSocket 地址
-REALTIME_MODEL = "gpt-4o-realtime-preview"
+REALTIME_MODEL = "gpt-realtime"
 WS_URL = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
 # Sam 的基础 persona
