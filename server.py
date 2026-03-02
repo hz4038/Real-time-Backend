@@ -17,26 +17,26 @@ from voice_agent_realtime import (
     call_realtime_text_only,
 )
 
-app = FastAPI(title="Sam Realtime Backend (Unity Frontend)")
+app = FastAPI(title="Sophia Realtime Backend (Unity Frontend)")
 
 # 全局初始化：API Key + 知识库
 api_key = ensure_api_key()
 kb = build_kb()
 
 # ── 故事进度追踪（全局，单会话）────────────────────────────────
-# 三个核心故事要素：分手原因 / 搬家原因 / 对未来的期待
+# 三个核心故事要素：基本情况 / 内心矛盾 / 被开导安慰
 story_progress = {
-    "breakup_reason": False,    # 讲过分手/结束感情的原因
-    "move_reason":    False,    # 讲过为什么选择这座新城市
-    "future_hope":    False,    # 表达过对未来的期待或希望
+    "basic_situation": False,   # 用户已了解 Sophia 的基本情况（身份、工作、这次旅程的原因）
+    "inner_conflict":  False,   # 用户已了解 Sophia 的内心矛盾（离家与责任、成长与愧疚）
+    "comforted":       False,   # 用户已给予 Sophia 安慰或开导，Sophia 表达了接受/感谢
 }
 
-# Sam 说再见时用的强制结束指令（追加到 instructions 末尾）
+# Sophia 说再见时用的强制结束指令（追加到 instructions 末尾）
 FAREWELL_INSTRUCTION = """
 ## IMPORTANT — End the Conversation Now
-You have now fully shared your story. This is your final message.
-Say a warm, natural goodbye to the person — something like you're feeling tired and going to sleep,
-or wishing them well on their journey. Keep it to 2-3 sentences.
+You have now fully shared your story and felt the warmth of this conversation. This is your final message.
+Say a heartfelt, natural goodbye to the person — you feel a little lighter now, like something has been gently untied.
+Thank them sincerely and wish them well. Keep it to 2-3 sentences.
 End your message with the exact token: [END_CONVERSATION]
 """
 
@@ -45,31 +45,32 @@ def all_story_told() -> bool:
     return all(story_progress.values())
 
 
-def check_story_progress(sam_text: str) -> None:
+def check_story_progress(sophia_text: str) -> None:
     """
-    用 GPT-4o-mini 分析 Sam 刚说的这句话，判断覆盖了哪些故事要素，
+    用 GPT-4o-mini 分析 Sophia 刚说的这句话，判断覆盖了哪些故事要素，
     并更新全局 story_progress。只对还未覆盖的要素做检测。
     """
     # 已经全部讲完就不用再检测了
     pending = [k for k, v in story_progress.items() if not v]
-    if not pending or not sam_text:
+    if not pending or not sophia_text:
         return
 
-    prompt = f"""You are analyzing a line of dialogue spoken by a fictional character named Sam.
-Sam is on a night train, having just ended a long relationship and moving to a new city.
+    prompt = f"""You are analyzing a line of dialogue spoken by a fictional character named Sophia.
+Sophia is a nurse on a long-distance train, heading back to her hometown to visit a hospitalized family elder.
+She carries a complex mix of pride in her growth and guilt for being away from family for so long.
 
-Sam just said:
-"{sam_text}"
+Sophia just said:
+"{sophia_text}"
 
 For each item below, answer only "yes" or "no" (lowercase, no punctuation):
-1. breakup_reason — Did Sam mention or hint at WHY the relationship ended or why she broke up?
-2. move_reason — Did Sam mention or hint at WHY she chose this specific new city to move to?
-3. future_hope — Did Sam express any hope, excitement, or positive feeling about her future?
+1. basic_situation — Has Sophia shared her basic background? (e.g. she is a nurse, she works in the city, she is on this train to visit a sick family member)
+2. inner_conflict — Has Sophia revealed her inner conflict or emotional tension? (e.g. feeling guilty for being away, torn between career and family, missing important family moments)
+3. comforted — Has Sophia expressed that she feels comforted, understood, or emotionally supported by the user? (e.g. thanking the user, saying she feels better, feeling less alone)
 
 Reply in this exact format (one per line):
-breakup_reason: yes/no
-move_reason: yes/no
-future_hope: yes/no"""
+basic_situation: yes/no
+inner_conflict: yes/no
+comforted: yes/no"""
 
     try:
         resp = http_requests.post(
@@ -85,7 +86,7 @@ future_hope: yes/no"""
         )
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"].strip()
-        print(f"[StoryCheck] Sam said: {sam_text[:80]}...")
+        print(f"[StoryCheck] Sophia said: {sophia_text[:80]}...")
         print(f"[StoryCheck] GPT-4o-mini result:\n{result}")
 
         for line in result.splitlines():
@@ -128,17 +129,17 @@ class SpeakResponse(BaseModel):
     transcript: str
     user_transcript: str = ""
     conversation_ended: bool = False
-    # 故事进度（三个核心要素是否已被 Sam 提及）
-    progress_breakup_reason: bool = False
-    progress_move_reason: bool = False
-    progress_future_hope: bool = False
+    # 故事进度（三个核心要素）
+    progress_basic_situation: bool = False
+    progress_inner_conflict: bool = False
+    progress_comforted: bool = False
 
 
 # ── 路由 ──────────────────────────────────────────────────────
 
-@app.get("/sam/greet", response_model=SpeakResponse)
-async def sam_greet():
-    """让 Sam 主动打一次招呼，重置故事进度。"""
+@app.get("/sophia/greet", response_model=SpeakResponse)
+async def sophia_greet():
+    """让 Sophia 主动打一次招呼，重置故事进度。"""
     reset_story_progress()
 
     greeting_user_text = (
@@ -162,15 +163,15 @@ async def sam_greet():
     )
 
 
-@app.post("/sam/speak", response_model=SpeakResponse)
-async def sam_speak(req: SpeakRequest):
+@app.post("/sophia/speak", response_model=SpeakResponse)
+async def sophia_speak(req: SpeakRequest):
     """
     对话主流程：
     1. STT 识别用户语音；
     2. 若故事已全部讲完，在 instructions 末尾追加强制告别指令；
     3. 否则正常构造带 KB 的 instructions；
-    4. 调用 Realtime 生成 Sam 的语音回复；
-    5. 用 GPT-4o-mini 检测本轮 Sam 的回复覆盖了哪些故事要素；
+    4. 调用 Realtime 生成 Sophia 的语音回复；
+    5. 用 GPT-4o-mini 检测本轮 Sophia 的回复覆盖了哪些故事要素；
     6. 检测 END_TOKEN 或故事全覆盖，决定是否返回 conversation_ended=True。
     """
     audio_bytes = base64.b64decode(req.audio_pcm16_b64)
@@ -192,7 +193,7 @@ async def sam_speak(req: SpeakRequest):
     # 2) 构造 instructions
     if all_story_told():
         # 故事已全部讲完 → 强制告别
-        print("[Backend] 故事三要素已全部覆盖，强制引导 Sam 结束对话。")
+        print("[Backend] 故事三要素已全部覆盖，强制引导 Sophia 结束对话。")
         instructions = SAM_INSTRUCTIONS + FAREWELL_INSTRUCTION
     else:
         instructions = build_instructions_with_kb(SAM_INSTRUCTIONS, user_text, kb)
@@ -208,7 +209,7 @@ async def sam_speak(req: SpeakRequest):
         print("[Backend] 调用 Realtime 失败：", e)
         return SpeakResponse(
             reply_pcm16_b64="",
-            transcript="Sorry, something went wrong while talking to Sam.",
+            transcript="Sorry, something went wrong while talking to Sophia.",
             conversation_ended=False,
         )
 
@@ -220,16 +221,16 @@ async def sam_speak(req: SpeakRequest):
     # 5) 用 GPT-4o-mini 更新故事进度
     was_complete_before = all_story_told()
     if transcript and not was_complete_before:
-        check_story_progress(transcript)
+        check_story_progress(transcript)  # 传入 Sophia 的回复文本
 
     just_completed = (not was_complete_before) and all_story_told()
 
     # 6) 判断是否结束
     ended = token_ended
 
-    # 6b) 若本轮故事刚好全部讲完，立刻让 Sam 当场说再见（不等下一轮用户输入）
+    # 6b) 若本轮故事刚好全部讲完，立刻让 Sophia 当场说再见（不等下一轮用户输入）
     if just_completed and not ended:
-        print("[Backend] 故事三要素刚全部覆盖，立即触发 Sam 说再见。")
+        print("[Backend] 故事三要素刚全部覆盖，立即触发 Sophia 说再见。")
         try:
             farewell_instructions = SAM_INSTRUCTIONS + FAREWELL_INSTRUCTION
             farewell_audio, farewell_transcript = await call_realtime_text_only(
@@ -244,7 +245,7 @@ async def sam_speak(req: SpeakRequest):
             ended = True  # 无论有没有 token，这条消息就是结束
 
             # 把 farewell 的音频和字幕拼到这次回包里一起返回
-            # 两段音频拼接：先播这轮 Sam 的话，再播告别语
+            # 两段音频拼接：先播这轮 Sophia 的话，再播告别语
             combined_audio = (audio_reply or b"") + (farewell_audio or b"")
             combined_transcript = transcript
             if farewell_transcript:
@@ -266,21 +267,21 @@ async def sam_speak(req: SpeakRequest):
         transcript=transcript,
         user_transcript=user_text or "",
         conversation_ended=ended,
-        progress_breakup_reason=story_progress["breakup_reason"],
-        progress_move_reason=story_progress["move_reason"],
-        progress_future_hope=story_progress["future_hope"],
+        progress_basic_situation=story_progress["basic_situation"],
+        progress_inner_conflict=story_progress["inner_conflict"],
+        progress_comforted=story_progress["comforted"],
     )
 
 
-@app.post("/sam/reset")
-async def sam_reset():
+@app.post("/sophia/reset")
+async def sophia_reset():
     """手动重置故事进度（调试用）。"""
     reset_story_progress()
     return {"status": "ok", "story_progress": story_progress}
 
 
-@app.get("/sam/progress")
-async def sam_progress():
+@app.get("/sophia/progress")
+async def sophia_progress():
     """查看当前故事进度（调试用）。"""
     return {
         "story_progress": story_progress,
