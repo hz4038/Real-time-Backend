@@ -23,6 +23,10 @@ app = FastAPI(title="Sophia Realtime Backend (Unity Frontend)")
 api_key = ensure_api_key()
 kb = build_kb()
 
+# ── 对话历史（全局，单会话）──────────────────────────────────────
+# 每条格式：{"role": "user"/"assistant", "text": "..."}
+conversation_history: list[dict] = []
+
 # ── 故事进度追踪（全局，单会话）────────────────────────────────
 # 三个核心故事要素：基本情况 / 内心矛盾 / 被开导安慰
 story_progress = {
@@ -113,9 +117,10 @@ def extract_end_flag(transcript: str) -> tuple[str, bool]:
 
 
 def reset_story_progress() -> None:
-    """重置故事进度（如需支持多次对话）。"""
+    """重置故事进度和对话历史（如需支持多次对话）。"""
     for key in story_progress:
         story_progress[key] = False
+    conversation_history.clear()
 
 
 # ── 数据模型 ──────────────────────────────────────────────────
@@ -152,8 +157,14 @@ async def sophia_greet():
         api_key=api_key,
         instructions=SAM_INSTRUCTIONS,
         user_text=greeting_user_text,
+        history=[],
     )
     transcript, ended = extract_end_flag(transcript or "")
+
+    # 把 Sophia 的开场白存入历史
+    if transcript:
+        conversation_history.append({"role": "assistant", "text": transcript})
+
     reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
     return SpeakResponse(
         reply_pcm16_b64=reply_b64,
@@ -189,6 +200,8 @@ async def sophia_speak(req: SpeakRequest):
 
     if user_text:
         print(f"[Backend] User STT: {user_text}")
+        # 把用户这句话追加进历史
+        conversation_history.append({"role": "user", "text": user_text})
 
     # 2) 构造 instructions
     if all_story_told():
@@ -198,12 +211,13 @@ async def sophia_speak(req: SpeakRequest):
     else:
         instructions = build_instructions_with_kb(SAM_INSTRUCTIONS, user_text, kb)
 
-    # 3) 调用 Realtime
+    # 3) 调用 Realtime（带完整历史）
     try:
         audio_reply, transcript = await call_realtime_once(
             audio_pcm16=audio_bytes,
             api_key=api_key,
             instructions=instructions,
+            history=list(conversation_history),
         )
     except Exception as e:
         print("[Backend] 调用 Realtime 失败：", e)
@@ -215,7 +229,10 @@ async def sophia_speak(req: SpeakRequest):
 
     transcript = transcript or ""
 
-    # 4) 检测 END_TOKEN（强制告别路径会带这个 token）
+    # 4) 把 Sophia 的回复追加进历史，再检测 END_TOKEN
+    if transcript:
+        conversation_history.append({"role": "assistant", "text": transcript})
+
     transcript, token_ended = extract_end_flag(transcript)
 
     # 5) 用 GPT-4o-mini 更新故事进度
@@ -243,6 +260,10 @@ async def sophia_speak(req: SpeakRequest):
             )
             farewell_transcript, farewell_ended = extract_end_flag(farewell_transcript or "")
             ended = True  # 无论有没有 token，这条消息就是结束
+
+            # farewell 也存入历史
+            if farewell_transcript:
+                conversation_history.append({"role": "assistant", "text": farewell_transcript})
 
             # 把 farewell 的音频和字幕拼到这次回包里一起返回
             # 两段音频拼接：先播这轮 Sophia 的话，再播告别语

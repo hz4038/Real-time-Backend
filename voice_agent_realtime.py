@@ -320,12 +320,14 @@ async def call_realtime_once(
     audio_pcm16: bytes,
     api_key: str,
     instructions: str = SAM_INSTRUCTIONS,
+    history: Optional[list] = None,
 ) -> Tuple[bytes, str]:
     """
     调用 Realtime：
     - 建立 WebSocket 连接；
     - session.update 设置 instructions + 音频/文本模式；
-    - conversation.item.create 发送一条包含 input_audio 的 user 消息；
+    - 先把历史消息逐条注入（conversation.item.create）；
+    - 再发送本轮包含 input_audio 的 user 消息；
     - response.create 请求模型基于当前对话生成回复；
     - 读取 response.audio.delta 和字幕事件。
     """
@@ -358,7 +360,23 @@ async def call_realtime_once(
         }
         await ws.send(json.dumps(session_update))
 
-        # 2) 发送带 input_audio 的 user 消息
+        # 2) 注入历史消息（最多保留最近 20 条，避免 token 过长）
+        if history:
+            for item in history[-20:]:
+                role = item.get("role", "user")
+                text = item.get("text", "")
+                if not text:
+                    continue
+                await ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                }))
+
+        # 3) 发送本轮带 input_audio 的 user 消息
         audio_b64 = base64.b64encode(audio_pcm16).decode("utf-8")
         print(f"[Debug] 发送到 Realtime 的音频字节数: {len(audio_pcm16)}")
         await ws.send(json.dumps({
@@ -375,7 +393,7 @@ async def call_realtime_once(
             },
         }))
 
-        # 3) 请求模型生成带音频 + 文本的回复
+        # 4) 请求模型生成带音频 + 文本的回复
         await ws.send(json.dumps({
             "type": "response.create",
             "response": {"modalities": ["audio", "text"]},
@@ -386,7 +404,7 @@ async def call_realtime_once(
         final_transcript: Optional[str] = None
         transcript_channel: Optional[str] = None  # 'audio_transcript' 或 'text'
 
-        # 4) 读取事件流：音频 + 字幕 / 文本
+        # 5) 读取事件流：音频 + 字幕 / 文本
         while True:
             msg = await ws.recv()
             try:
@@ -460,9 +478,11 @@ async def call_realtime_text_only(
     api_key: str,
     instructions: str,
     user_text: str,
+    history: Optional[list] = None,
 ) -> Tuple[bytes, str]:
     """
-    只发送一条 input_text，让 Sam 先开场说话（不需要你先提供音频）。
+    只发送一条 input_text，让 Sophia 先开场说话（不需要你先提供音频）。
+    可选传入 history 注入历史上下文。
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -490,7 +510,23 @@ async def call_realtime_text_only(
         }
         await ws.send(json.dumps(session_update))
 
-        # 2) 发送一条带 input_text 的 user 消息
+        # 2) 注入历史消息（最多最近 20 条）
+        if history:
+            for item in history[-20:]:
+                role = item.get("role", "user")
+                text = item.get("text", "")
+                if not text:
+                    continue
+                await ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                }))
+
+        # 3) 发送本轮带 input_text 的 user 消息
         await ws.send(json.dumps({
             "type": "conversation.item.create",
             "item": {
