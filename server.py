@@ -35,12 +35,29 @@ story_progress = {
     "comforted":       False,   # 用户已给予 Sophia 安慰或开导，Sophia 表达了接受/感谢
 }
 
-# Sophia 说再见时用的强制结束指令（追加到 instructions 末尾）
+# 故事完成后进入"收尾倒计时"，最多再走 2 轮后强制结束
+# winding_down_turns = 0 表示尚未进入收尾模式
+winding_down_turns: int = 0
+WINDING_DOWN_MAX: int = 2        # 收尾轮数上限
+
+# ── 收尾引导指令（三要素全达成后追加）──────────────────────────
+# 让 Sophia 在接下来 1-2 轮自然地把话收拢，做出告别信号，最终带上 END_TOKEN
+WINDING_DOWN_INSTRUCTION = """
+## Gentle Story Wrap-Up (Internal Guidance — do NOT mention this to the player)
+The conversation has reached a natural emotional conclusion. You've shared your story and felt genuine warmth from this person.
+From now on, gradually bring the conversation to a close. Do this naturally over the next 1-2 exchanges:
+- Speak in a softer, more settled tone — you feel lighter, like something has been gently untied.
+- Weave in small physical cues of the journey ending: glance out the window, notice the landscape changing, mention the train will arrive soon.
+- You do NOT need to end immediately. Let the goodbye feel earned and unhurried.
+- When the moment feels right (within the next reply or two), say a warm and sincere farewell.
+- End your very last message with the exact token: [END_CONVERSATION]
+"""
+
+# 强制最终告别指令（收尾轮数耗尽时使用）
 FAREWELL_INSTRUCTION = """
-## IMPORTANT — End the Conversation Now
-You have now fully shared your story and felt the warmth of this conversation. This is your final message.
-Say a heartfelt, natural goodbye to the person — you feel a little lighter now, like something has been gently untied.
-Thank them sincerely and wish them well. Keep it to 2-3 sentences.
+## IMPORTANT — This Is Your Final Message
+The journey is almost over. Say a heartfelt, natural goodbye — you feel lighter now, like something has been gently untied.
+Thank this person sincerely. Keep it to 2-3 warm sentences.
 End your message with the exact token: [END_CONVERSATION]
 """
 
@@ -51,94 +68,116 @@ def all_story_told() -> bool:
 
 def check_story_progress(sophia_text: str, user_text: str = "") -> None:
     """
-    用 GPT-4o-mini 分析本轮对话，判断各故事要素是否达成，并更新全局 story_progress。
-    - basic_situation / inner_conflict：看 Sophia 是否明确说出了相关内容
-    - comforted：看用户是否说了安慰/鼓励的话，且 Sophia 表达了接受/感谢
-    只检测还未完成的要素。
+    基于【完整对话历史 + 本轮对话】做累积判断，只检测还未完成的要素。
+    使用 system/user 双 role 强制约束，并要求模型先输出判断理由再给结论。
     """
     pending = [k for k, v in story_progress.items() if not v]
-    if not pending:
+    if not pending or (not sophia_text and not user_text):
         return
 
-    # 构造本轮对话摘要，只传必要的文本
-    this_turn = ""
-    if user_text:
-        this_turn += f'User said: "{user_text}"\n'
-    if sophia_text:
-        this_turn += f'Sophia said: "{sophia_text}"\n'
-    if not this_turn.strip():
-        return
+    # ── 1. 拼装完整对话记录（最近 30 条，避免 token 过长）──────────
+    history_lines = []
+    for item in conversation_history[-30:]:
+        role_label = "User" if item["role"] == "user" else "Sophia"
+        history_lines.append(f'{role_label}: "{item["text"]}"')
+    full_history = "\n".join(history_lines) if history_lines else "(conversation just started)"
 
-    # 只检测还未完成的要素，减少误判
-    checks = []
-    rules = []
+    # ── 2. 根据 pending 动态生成判断标准 ────────────────────────────
+    criteria_blocks = []
+
     if "basic_situation" in pending:
-        checks.append("basic_situation")
-        rules.append(
-            "basic_situation — Answer YES only if Sophia has EXPLICITLY stated ALL THREE of the following in this or previous turns:\n"
-            "  (a) she works as a nurse (or in the medical field) in a city\n"
-            "  (b) she is currently on a train heading back to her hometown\n"
-            "  (c) the reason is to visit a sick/hospitalized family member\n"
-            "  If any of the three is missing or only vaguely hinted at, answer NO."
+        criteria_blocks.append(
+            "=== CRITERION A: basic_situation ===\n"
+            "Mark DONE only when Sophia has stated, CLEARLY AND EXPLICITLY, ALL THREE facts:\n"
+            "  [A1] She is a nurse (or works in a medical/healthcare role) in a city.\n"
+            "  [A2] She is currently on a long-distance train traveling toward her hometown.\n"
+            "  [A3] The specific reason for this trip is to visit a family member who is sick or hospitalized.\n"
+            "STRICT rule: if ANY of A1/A2/A3 has only been hinted at, implied, or never mentioned → answer 'no'.\n"
+            "Example of NOT enough: Sophia says 'I work long shifts' (A1 missing specifics), or 'I'm going home' (A3 missing).\n"
+            "Example of ENOUGH: Sophia says 'I'm a nurse in the city, and I'm on this train because my grandmother is in the hospital back home.'"
         )
+
     if "inner_conflict" in pending:
-        checks.append("inner_conflict")
-        rules.append(
-            "inner_conflict — Answer YES only if Sophia has CLEARLY expressed an internal emotional struggle, such as:\n"
-            "  feeling guilty or regretful for being away from family for years, or\n"
-            "  feeling torn between her career in the city and her responsibilities to family, or\n"
-            "  expressing that she has missed important family moments and carries that weight.\n"
-            "  A passing mention of being tired or missing home is NOT enough. The conflict must be emotionally explicit. If uncertain, answer NO."
+        criteria_blocks.append(
+            "=== CRITERION B: inner_conflict ===\n"
+            "Mark DONE only when Sophia has EXPLICITLY verbalized a deep emotional tension. She must express at least ONE of:\n"
+            "  [B1] Guilt or regret for having been physically absent from family for years (not just 'I miss home').\n"
+            "  [B2] Feeling torn between her professional life in the city and her duty/love for family back home.\n"
+            "  [B3] The pain of having missed important family milestones or moments because of her career.\n"
+            "STRICT rule:\n"
+            "  - Saying she is 'tired' or 'stressed at work' is NOT enough.\n"
+            "  - Saying she 'misses home' or 'hasn't been back in a while' is NOT enough.\n"
+            "  - The internal conflict must be emotionally explicit — she must name the tension, not just describe fatigue.\n"
+            "Example of NOT enough: 'Work has been really exhausting lately.'\n"
+            "Example of ENOUGH: 'I keep telling myself the career was worth it, but then I think about all the birthdays I missed, and I'm not sure I believe it anymore.'"
         )
+
     if "comforted" in pending:
-        checks.append("comforted")
-        rules.append(
-            "comforted — Answer YES only if BOTH of the following are true:\n"
-            "  (a) The USER said something genuinely supportive, encouraging, or empathetic toward Sophia's situation (not just a neutral reply or a question)\n"
-            "  (b) Sophia's reply shows she received that comfort — e.g. she thanks the user, says she feels better/lighter, or expresses that talking helped.\n"
-            "  If the user said nothing comforting, or Sophia did not respond with gratitude/relief, answer NO."
+        criteria_blocks.append(
+            "=== CRITERION C: comforted ===\n"
+            "Mark DONE only when BOTH conditions are clearly met in the conversation:\n"
+            "  [C1] The USER made a genuine, specific gesture of support, comfort, or empathy toward Sophia's situation.\n"
+            "       - A simple question ('really?', 'oh?') or neutral acknowledgment ('I see') does NOT count.\n"
+            "       - The user must say something that shows they understand Sophia's struggle and offer emotional support.\n"
+            "       - Examples that COUNT: 'You shouldn't be so hard on yourself.', 'It sounds like you really care about your family.', 'Being there now is what matters.'\n"
+            "  [C2] Sophia's response shows she genuinely received and accepted that comfort.\n"
+            "       - She must express relief, gratitude, or that the conversation helped (e.g. 'That actually helps.', 'Thank you, I needed to hear that.', 'I feel a little lighter now.').\n"
+            "       - Sophia simply saying 'thank you' for something unrelated does NOT count.\n"
+            "STRICT rule: if C1 is missing (user didn't comfort her) OR C2 is missing (Sophia didn't show she felt comforted) → answer 'no'."
         )
 
-    rules_text = "\n\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
-    keys_format = "\n".join(f"{k}: yes/no" for k in checks)
+    criteria_text = "\n\n".join(criteria_blocks)
+    pending_keys_format = "\n".join(f"{k}: yes/no  # your brief reason" for k in pending)
 
-    prompt = f"""You are a strict story-progress checker for a narrative game.
-A fictional character named Sophia (a nurse on a train visiting a sick family elder) is having a conversation with the player.
+    system_prompt = (
+        "You are a STRICT pass/fail evaluator for a narrative game. "
+        "Your only job is to check whether specific story milestones have been clearly achieved in a conversation. "
+        "You have a strong bias toward 'no' — you only say 'yes' when the evidence is unambiguous and explicit. "
+        "Vague hints, implications, and near-misses always count as 'no'. "
+        "Do not be generous. Do not give benefit of the doubt."
+    )
 
-Here is what happened in THIS turn:
-{this_turn.strip()}
-
-Evaluate ONLY the following criteria. Apply the rules strictly — when in doubt, answer "no".
-
-{rules_text}
-
-Reply ONLY in this exact format, one line per criterion, no extra text:
-{keys_format}"""
+    user_prompt = (
+        f"Here is the full conversation so far:\n"
+        f"---\n{full_history}\n---\n\n"
+        f"Evaluate ONLY these pending criteria:\n\n"
+        f"{criteria_text}\n\n"
+        f"Reply in EXACTLY this format (one line per criterion, include a short reason after #):\n"
+        f"{pending_keys_format}"
+    )
 
     try:
         resp = http_requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 40,
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "max_tokens": 120,
                 "temperature": 0,
             },
-            timeout=10,
+            timeout=15,
         )
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"].strip()
-        print(f"[StoryCheck] This turn — User: '{user_text[:60]}' | Sophia: '{sophia_text[:60]}'")
-        print(f"[StoryCheck] GPT-4o-mini result:\n{result}")
+        print(f"[StoryCheck] ── evaluating pending={pending}")
+        print(f"[StoryCheck] GPT-4o result:\n{result}")
 
         for line in result.splitlines():
-            line = line.strip().lower()
-            for key in checks:
-                if line.startswith(key + ":") and "yes" in line:
-                    if not story_progress[key]:
-                        story_progress[key] = True
-                        print(f"[StoryCheck] ✅ '{key}' 已覆盖！进度: {story_progress}")
+            # 格式：  basic_situation: yes  # because ...
+            # 取冒号后、#号前的部分
+            if ":" not in line:
+                continue
+            key_part, _, rest = line.partition(":")
+            key_part = key_part.strip().lower()
+            verdict = rest.split("#")[0].strip().lower()   # 去掉 # 注释部分
+            if key_part in pending and "yes" in verdict:
+                if not story_progress[key_part]:
+                    story_progress[key_part] = True
+                    print(f"[StoryCheck] ✅ '{key_part}' 已覆盖！进度: {story_progress}")
 
     except Exception as e:
         print(f"[StoryCheck] 检测失败（忽略）: {e}")
@@ -157,9 +196,11 @@ def extract_end_flag(transcript: str) -> tuple[str, bool]:
 
 def reset_story_progress() -> None:
     """重置故事进度和对话历史（如需支持多次对话）。"""
+    global winding_down_turns
     for key in story_progress:
         story_progress[key] = False
     conversation_history.clear()
+    winding_down_turns = 0
 
 
 # ── 数据模型 ──────────────────────────────────────────────────
@@ -243,10 +284,20 @@ async def sophia_speak(req: SpeakRequest):
         conversation_history.append({"role": "user", "text": user_text})
 
     # 2) 构造 instructions
-    if all_story_told():
-        # 故事已全部讲完 → 强制告别
-        print("[Backend] 故事三要素已全部覆盖，强制引导 Sophia 结束对话。")
+    global winding_down_turns
+    if winding_down_turns >= WINDING_DOWN_MAX:
+        # 收尾轮数已耗尽 → 强制最终告别
+        print(f"[Backend] 收尾轮数耗尽({winding_down_turns}/{WINDING_DOWN_MAX})，强制触发告别。")
         instructions = SAM_INSTRUCTIONS + FAREWELL_INSTRUCTION
+    elif winding_down_turns > 0:
+        # 收尾倒计时进行中 → 继续引导自然收尾
+        print(f"[Backend] 收尾倒计时中({winding_down_turns}/{WINDING_DOWN_MAX})，引导自然结束。")
+        instructions = SAM_INSTRUCTIONS + WINDING_DOWN_INSTRUCTION
+    elif all_story_told():
+        # 三要素刚全部达成，这一轮就开始收尾（不立刻结束）
+        print("[Backend] 三要素首次全覆盖，进入收尾模式第 1 轮。")
+        winding_down_turns = 1
+        instructions = SAM_INSTRUCTIONS + WINDING_DOWN_INSTRUCTION
     else:
         instructions = build_instructions_with_kb(SAM_INSTRUCTIONS, user_text, kb)
 
@@ -274,52 +325,27 @@ async def sophia_speak(req: SpeakRequest):
 
     transcript, token_ended = extract_end_flag(transcript)
 
-    # 5) 用 GPT-4o-mini 更新故事进度（同时传入用户这句话，comforted 需要两方确认）
+    # 5) 更新故事进度（仅在收尾模式之前）
     was_complete_before = all_story_told()
     if transcript and not was_complete_before:
         check_story_progress(transcript, user_text or "")
-
     just_completed = (not was_complete_before) and all_story_told()
 
-    # 6) 判断是否结束
+    # 6) 收尾倒计时推进
+    if winding_down_turns > 0 and not token_ended:
+        # 已在收尾模式但 Sophia 还没说 END_TOKEN → 推进计数
+        winding_down_turns += 1
+        print(f"[Backend] 收尾轮数推进至 {winding_down_turns}/{WINDING_DOWN_MAX}")
+    elif just_completed and winding_down_turns == 0:
+        # 三要素本轮刚达成（之前还没进收尾），从下一轮开始收尾
+        # （此轮 instructions 已经是 WINDING_DOWN，所以 winding_down_turns 设为 1）
+        winding_down_turns = 1
+        print(f"[Backend] 三要素达成，收尾倒计时启动（turns=1）")
+
+    # 7) 判断是否对话结束
     ended = token_ended
-
-    # 6b) 若本轮故事刚好全部讲完，立刻让 Sophia 当场说再见（不等下一轮用户输入）
-    if just_completed and not ended:
-        print("[Backend] 故事三要素刚全部覆盖，立即触发 Sophia 说再见。")
-        try:
-            farewell_instructions = SAM_INSTRUCTIONS + FAREWELL_INSTRUCTION
-            farewell_audio, farewell_transcript = await call_realtime_text_only(
-                api_key=api_key,
-                instructions=farewell_instructions,
-                user_text=(
-                    "The conversation has reached a natural end. "
-                    "Please say a warm goodbye now."
-                ),
-            )
-            farewell_transcript, farewell_ended = extract_end_flag(farewell_transcript or "")
-            ended = True  # 无论有没有 token，这条消息就是结束
-
-            # farewell 也存入历史
-            if farewell_transcript:
-                conversation_history.append({"role": "assistant", "text": farewell_transcript})
-
-            # 把 farewell 的音频和字幕拼到这次回包里一起返回
-            # 两段音频拼接：先播这轮 Sophia 的话，再播告别语
-            combined_audio = (audio_reply or b"") + (farewell_audio or b"")
-            combined_transcript = transcript
-            if farewell_transcript:
-                combined_transcript = (transcript + " " + farewell_transcript).strip()
-
-            audio_reply = combined_audio
-            transcript = combined_transcript
-            print(f"[Backend] Farewell transcript: {farewell_transcript}")
-        except Exception as e:
-            print(f"[Backend] 触发告别失败，将在下一轮处理: {e}")
-            ended = False  # 失败了就下一轮再来
-
     if ended:
-        print("[Backend] conversation_ended=True")
+        print("[Backend] conversation_ended=True（Sophia 发出了 END_TOKEN）")
 
     reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
     return SpeakResponse(
