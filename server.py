@@ -40,6 +40,19 @@ story_progress = {
 winding_down_turns: int = 0
 WINDING_DOWN_MAX: int = 2        # 收尾轮数上限
 
+# ── 故事检测：最少对话轮数保护 ──────────────────────────────────
+# 前 N 轮对话不做故事检测，避免 Sophia 刚开口就误触发
+# 每次用户说一句话 = 一轮
+STORY_CHECK_MIN_TURNS: int = 1   # 至少对话 1 轮后才开始检测
+dialog_turn_count: int = 0       # 已完成的对话轮数计数
+
+# ── 方案A：对话摘要缓存（减少 Evaluator Token 消耗）────────────
+# 每隔 SUMMARY_UPDATE_EVERY 轮，把旧历史压缩成一段摘要
+# Evaluator 只看：摘要 + 最近 RECENT_TURNS_KEPT 轮原文
+conversation_summary: str = ""   # 当前维护的对话摘要
+SUMMARY_UPDATE_EVERY: int = 5    # 每 5 轮更新一次摘要
+RECENT_TURNS_KEPT: int = 3       # 摘要之外保留的最近原文轮数
+
 # ── 收尾引导指令（三要素全达成后追加）──────────────────────────
 # 让 Sophia 在接下来 1-2 轮自然地把话收拢，做出告别信号，最终带上 END_TOKEN
 WINDING_DOWN_INSTRUCTION = """
@@ -66,21 +79,85 @@ def all_story_told() -> bool:
     return all(story_progress.values())
 
 
+def update_summary() -> None:
+    """
+    方案A：将【除最近 RECENT_TURNS_KEPT 条之外】的历史对话压缩成摘要。
+    每隔 SUMMARY_UPDATE_EVERY 轮触发一次，用 gpt-4o-mini 生成简短摘要。
+    """
+    global conversation_summary
+    # 如果历史条数不够多，无需摘要
+    if len(conversation_history) <= RECENT_TURNS_KEPT:
+        return
+
+    # 需要被摘要的部分（除掉最近几轮）
+    to_summarize = conversation_history[:-RECENT_TURNS_KEPT]
+    lines = []
+    for item in to_summarize:
+        role_label = "User" if item["role"] == "user" else "Sophia"
+        lines.append(f'{role_label}: "{item["text"]}"')
+    dialog_text = "\n".join(lines)
+
+    try:
+        resp = http_requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a concise dialogue summarizer for a narrative game. "
+                            "Summarize the following conversation excerpt in plain English. "
+                            "Focus on: who Sophia is, why she's on the train, what emotional conflicts she mentioned, "
+                            "and any comfort/support the user offered. Keep the summary under 120 words. "
+                            "Be factual and specific — do not add anything not in the conversation."
+                        ),
+                    },
+                    {"role": "user", "content": dialog_text},
+                ],
+                "max_tokens": 180,
+                "temperature": 0,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        conversation_summary = resp.json()["choices"][0]["message"]["content"].strip()
+        print(f"[Summary] ✅ 摘要已更新（覆盖 {len(to_summarize)} 条历史）:\n{conversation_summary}")
+    except Exception as e:
+        print(f"[Summary] 摘要生成失败（忽略）: {e}")
+
+
 def check_story_progress(sophia_text: str, user_text: str = "") -> None:
     """
-    基于【完整对话历史 + 本轮对话】做累积判断，只检测还未完成的要素。
+    方案A：基于【对话摘要 + 最近几轮原文】做累积判断，只检测还未完成的要素。
     使用 system/user 双 role 强制约束，并要求模型先输出判断理由再给结论。
     """
     pending = [k for k, v in story_progress.items() if not v]
     if not pending or (not sophia_text and not user_text):
         return
 
-    # ── 1. 拼装完整对话记录（最近 30 条，避免 token 过长）──────────
-    history_lines = []
-    for item in conversation_history[-30:]:
+    # ── 1. 拼装上下文：摘要 + 最近 RECENT_TURNS_KEPT 轮原文 ────────
+    recent_lines = []
+    for item in conversation_history[-RECENT_TURNS_KEPT * 2:]:   # 每轮含 user+assistant 共 2 条
         role_label = "User" if item["role"] == "user" else "Sophia"
-        history_lines.append(f'{role_label}: "{item["text"]}"')
-    full_history = "\n".join(history_lines) if history_lines else "(conversation just started)"
+        recent_lines.append(f'{role_label}: "{item["text"]}"')
+    recent_text = "\n".join(recent_lines) if recent_lines else "(no recent dialogue)"
+
+    if conversation_summary:
+        full_history = (
+            f"[Earlier conversation summary]\n{conversation_summary}\n\n"
+            f"[Recent dialogue]\n{recent_text}"
+        )
+        print(f"[StoryCheck] 使用摘要模式（摘要+最近{RECENT_TURNS_KEPT}轮原文）")
+    else:
+        # 摘要尚未生成时，退化为原始全历史（最多30条）
+        raw_lines = []
+        for item in conversation_history[-30:]:
+            role_label = "User" if item["role"] == "user" else "Sophia"
+            raw_lines.append(f'{role_label}: "{item["text"]}"')
+        full_history = "\n".join(raw_lines) if raw_lines else "(conversation just started)"
+        print(f"[StoryCheck] 使用完整历史模式（摘要未就绪，共{len(conversation_history)}条）")
 
     # ── 2. 根据 pending 动态生成判断标准 ────────────────────────────
     criteria_blocks = []
@@ -151,7 +228,7 @@ def check_story_progress(sophia_text: str, user_text: str = "") -> None:
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "model": "gpt-4o",
+                "model": "gpt-4o-mini",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": user_prompt},
@@ -196,11 +273,13 @@ def extract_end_flag(transcript: str) -> tuple[str, bool]:
 
 def reset_story_progress() -> None:
     """重置故事进度和对话历史（如需支持多次对话）。"""
-    global winding_down_turns
+    global winding_down_turns, dialog_turn_count, conversation_summary
     for key in story_progress:
         story_progress[key] = False
     conversation_history.clear()
     winding_down_turns = 0
+    dialog_turn_count = 0
+    conversation_summary = ""    # 方案A：同步清空摘要缓存
 
 
 # ── 数据模型 ──────────────────────────────────────────────────
@@ -325,10 +404,28 @@ async def sophia_speak(req: SpeakRequest):
 
     transcript, token_ended = extract_end_flag(transcript)
 
-    # 5) 更新故事进度（仅在收尾模式之前）
+    # 5) 更新故事进度（仅在收尾模式之前，且达到最少轮数要求后）
+    global dialog_turn_count
+    if user_text:
+        dialog_turn_count += 1
+
+    # 方案A：每隔 SUMMARY_UPDATE_EVERY 轮，异步更新对话摘要
+    # 在收尾模式开始前才做摘要，收尾后无需再更新
+    if (
+        dialog_turn_count > 0
+        and dialog_turn_count % SUMMARY_UPDATE_EVERY == 0
+        and winding_down_turns == 0
+        and not all_story_told()
+    ):
+        print(f"[Summary] 第 {dialog_turn_count} 轮，触发摘要更新...")
+        update_summary()
+
     was_complete_before = all_story_told()
     if transcript and not was_complete_before:
-        check_story_progress(transcript, user_text or "")
+        if dialog_turn_count >= STORY_CHECK_MIN_TURNS:
+            check_story_progress(transcript, user_text or "")
+        else:
+            print(f"[StoryCheck] 跳过检测（当前轮数 {dialog_turn_count} < 最低要求 {STORY_CHECK_MIN_TURNS}）")
     just_completed = (not was_complete_before) and all_story_told()
 
     # 6) 收尾倒计时推进
