@@ -312,25 +312,34 @@ async def sophia_greet():
         "then stop and wait for the other person to reply."
     )
 
-    audio_reply, transcript = await call_realtime_text_only(
-        api_key=api_key,
-        instructions=SAM_INSTRUCTIONS,
-        user_text=greeting_user_text,
-        history=[],
-    )
-    transcript, ended = extract_end_flag(transcript or "")
+    try:
+        audio_reply, transcript = await call_realtime_text_only(
+            api_key=api_key,
+            instructions=SAM_INSTRUCTIONS,
+            user_text=greeting_user_text,
+            history=[],
+        )
+        transcript, ended = extract_end_flag(transcript or "")
 
-    # 把 Sophia 的开场白存入历史
-    if transcript:
-        conversation_history.append({"role": "assistant", "text": transcript})
+        # 把 Sophia 的开场白存入历史
+        if transcript:
+            conversation_history.append({"role": "assistant", "text": transcript})
 
-    reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
-    return SpeakResponse(
-        reply_pcm16_b64=reply_b64,
-        transcript=transcript,
-        user_transcript="",
-        conversation_ended=ended,
-    )
+        reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
+        return SpeakResponse(
+            reply_pcm16_b64=reply_b64,
+            transcript=transcript,
+            user_transcript="",
+            conversation_ended=ended,
+        )
+    except Exception as e:
+        print(f"[Backend] /sophia/greet failed: {repr(e)}")
+        return SpeakResponse(
+            reply_pcm16_b64="",
+            transcript="Hi, I'm Sofia. Nice to meet you.",
+            user_transcript="",
+            conversation_ended=False,
+        )
 
 
 @app.post("/sophia/speak", response_model=SpeakResponse)
@@ -344,116 +353,128 @@ async def sophia_speak(req: SpeakRequest):
     5. 用 GPT-4o-mini 检测本轮 Sophia 的回复覆盖了哪些故事要素；
     6. 检测 END_TOKEN 或故事全覆盖，决定是否返回 conversation_ended=True。
     """
-    audio_bytes = base64.b64decode(req.audio_pcm16_b64)
-    if not audio_bytes:
-        return SpeakResponse(reply_pcm16_b64="", transcript="", conversation_ended=False)
-
-    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32767.0
-
-    # 1) STT
     try:
-        user_text = transcribe_audio_to_text(audio_np, SAMPLE_RATE, api_key)
-    except Exception as e:
-        print("[Backend] STT 失败：", e)
-        user_text = ""
+        audio_bytes = base64.b64decode(req.audio_pcm16_b64)
+        if not audio_bytes:
+            return SpeakResponse(reply_pcm16_b64="", transcript="", conversation_ended=False)
 
-    if user_text:
-        print(f"[Backend] User STT: {user_text}")
-        # 把用户这句话追加进历史
-        conversation_history.append({"role": "user", "text": user_text})
+        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32767.0
 
-    # 2) 构造 instructions
-    global winding_down_turns
-    if winding_down_turns >= WINDING_DOWN_MAX:
-        # 收尾轮数已耗尽 → 强制最终告别
-        print(f"[Backend] 收尾轮数耗尽({winding_down_turns}/{WINDING_DOWN_MAX})，强制触发告别。")
-        instructions = SAM_INSTRUCTIONS + FAREWELL_INSTRUCTION
-    elif winding_down_turns > 0:
-        # 收尾倒计时进行中 → 继续引导自然收尾
-        print(f"[Backend] 收尾倒计时中({winding_down_turns}/{WINDING_DOWN_MAX})，引导自然结束。")
-        instructions = SAM_INSTRUCTIONS + WINDING_DOWN_INSTRUCTION
-    elif all_story_told():
-        # 三要素刚全部达成，这一轮就开始收尾（不立刻结束）
-        print("[Backend] 三要素首次全覆盖，进入收尾模式第 1 轮。")
-        winding_down_turns = 1
-        instructions = SAM_INSTRUCTIONS + WINDING_DOWN_INSTRUCTION
-    else:
-        instructions = build_instructions_with_kb(SAM_INSTRUCTIONS, user_text, kb)
+        # 1) STT
+        try:
+            user_text = transcribe_audio_to_text(audio_np, SAMPLE_RATE, api_key)
+        except Exception as e:
+            print("[Backend] STT 失败：", e)
+            user_text = ""
 
-    # 3) 调用 Realtime（带完整历史）
-    try:
-        audio_reply, transcript = await call_realtime_once(
-            audio_pcm16=audio_bytes,
-            api_key=api_key,
-            instructions=instructions,
-            history=list(conversation_history),
+        if user_text:
+            print(f"[Backend] User STT: {user_text}")
+            # 把用户这句话追加进历史
+            conversation_history.append({"role": "user", "text": user_text})
+
+        # 2) 构造 instructions
+        global winding_down_turns
+        if winding_down_turns >= WINDING_DOWN_MAX:
+            # 收尾轮数已耗尽 → 强制最终告别
+            print(f"[Backend] 收尾轮数耗尽({winding_down_turns}/{WINDING_DOWN_MAX})，强制触发告别。")
+            instructions = SAM_INSTRUCTIONS + FAREWELL_INSTRUCTION
+        elif winding_down_turns > 0:
+            # 收尾倒计时进行中 → 继续引导自然收尾
+            print(f"[Backend] 收尾倒计时中({winding_down_turns}/{WINDING_DOWN_MAX})，引导自然结束。")
+            instructions = SAM_INSTRUCTIONS + WINDING_DOWN_INSTRUCTION
+        elif all_story_told():
+            # 三要素刚全部达成，这一轮就开始收尾（不立刻结束）
+            print("[Backend] 三要素首次全覆盖，进入收尾模式第 1 轮。")
+            winding_down_turns = 1
+            instructions = SAM_INSTRUCTIONS + WINDING_DOWN_INSTRUCTION
+        else:
+            instructions = build_instructions_with_kb(SAM_INSTRUCTIONS, user_text, kb)
+
+        # 3) 调用 Realtime（带完整历史）
+        try:
+            audio_reply, transcript = await call_realtime_once(
+                audio_pcm16=audio_bytes,
+                api_key=api_key,
+                instructions=instructions,
+                history=list(conversation_history),
+            )
+        except Exception as e:
+            print("[Backend] 调用 Realtime 失败：", e)
+            return SpeakResponse(
+                reply_pcm16_b64="",
+                transcript="Sorry, something went wrong while talking to Sophia.",
+                conversation_ended=False,
+            )
+
+        transcript = transcript or ""
+
+        # 4) 把 Sophia 的回复追加进历史，再检测 END_TOKEN
+        if transcript:
+            conversation_history.append({"role": "assistant", "text": transcript})
+
+        transcript, token_ended = extract_end_flag(transcript)
+
+        # 5) 更新故事进度（仅在收尾模式之前，且达到最少轮数要求后）
+        global dialog_turn_count
+        if user_text:
+            dialog_turn_count += 1
+
+        # 方案A：每隔 SUMMARY_UPDATE_EVERY 轮，异步更新对话摘要
+        # 在收尾模式开始前才做摘要，收尾后无需再更新
+        if (
+            dialog_turn_count > 0
+            and dialog_turn_count % SUMMARY_UPDATE_EVERY == 0
+            and winding_down_turns == 0
+            and not all_story_told()
+        ):
+            print(f"[Summary] 第 {dialog_turn_count} 轮，触发摘要更新...")
+            update_summary()
+
+        was_complete_before = all_story_told()
+        if transcript and not was_complete_before:
+            if dialog_turn_count >= STORY_CHECK_MIN_TURNS:
+                check_story_progress(transcript, user_text or "")
+            else:
+                print(f"[StoryCheck] 跳过检测（当前轮数 {dialog_turn_count} < 最低要求 {STORY_CHECK_MIN_TURNS}）")
+        just_completed = (not was_complete_before) and all_story_told()
+
+        # 6) 收尾倒计时推进
+        if winding_down_turns > 0 and not token_ended:
+            # 已在收尾模式但 Sophia 还没说 END_TOKEN → 推进计数
+            winding_down_turns += 1
+            print(f"[Backend] 收尾轮数推进至 {winding_down_turns}/{WINDING_DOWN_MAX}")
+        elif just_completed and winding_down_turns == 0:
+            # 三要素本轮刚达成（之前还没进收尾），从下一轮开始收尾
+            # （此轮 instructions 已经是 WINDING_DOWN，所以 winding_down_turns 设为 1）
+            winding_down_turns = 1
+            print(f"[Backend] 三要素达成，收尾倒计时启动（turns=1）")
+
+        # 7) 判断是否对话结束
+        ended = token_ended
+        if ended:
+            print("[Backend] conversation_ended=True（Sophia 发出了 END_TOKEN）")
+
+        reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
+        return SpeakResponse(
+            reply_pcm16_b64=reply_b64,
+            transcript=transcript,
+            user_transcript=user_text or "",
+            conversation_ended=ended,
+            progress_basic_situation=story_progress["basic_situation"],
+            progress_inner_conflict=story_progress["inner_conflict"],
+            progress_comforted=story_progress["comforted"],
         )
     except Exception as e:
-        print("[Backend] 调用 Realtime 失败：", e)
+        print(f"[Backend] /sophia/speak unhandled error: {repr(e)}")
         return SpeakResponse(
             reply_pcm16_b64="",
-            transcript="Sorry, something went wrong while talking to Sophia.",
+            transcript="Sorry, backend failed unexpectedly.",
+            user_transcript="",
             conversation_ended=False,
+            progress_basic_situation=story_progress["basic_situation"],
+            progress_inner_conflict=story_progress["inner_conflict"],
+            progress_comforted=story_progress["comforted"],
         )
-
-    transcript = transcript or ""
-
-    # 4) 把 Sophia 的回复追加进历史，再检测 END_TOKEN
-    if transcript:
-        conversation_history.append({"role": "assistant", "text": transcript})
-
-    transcript, token_ended = extract_end_flag(transcript)
-
-    # 5) 更新故事进度（仅在收尾模式之前，且达到最少轮数要求后）
-    global dialog_turn_count
-    if user_text:
-        dialog_turn_count += 1
-
-    # 方案A：每隔 SUMMARY_UPDATE_EVERY 轮，异步更新对话摘要
-    # 在收尾模式开始前才做摘要，收尾后无需再更新
-    if (
-        dialog_turn_count > 0
-        and dialog_turn_count % SUMMARY_UPDATE_EVERY == 0
-        and winding_down_turns == 0
-        and not all_story_told()
-    ):
-        print(f"[Summary] 第 {dialog_turn_count} 轮，触发摘要更新...")
-        update_summary()
-
-    was_complete_before = all_story_told()
-    if transcript and not was_complete_before:
-        if dialog_turn_count >= STORY_CHECK_MIN_TURNS:
-            check_story_progress(transcript, user_text or "")
-        else:
-            print(f"[StoryCheck] 跳过检测（当前轮数 {dialog_turn_count} < 最低要求 {STORY_CHECK_MIN_TURNS}）")
-    just_completed = (not was_complete_before) and all_story_told()
-
-    # 6) 收尾倒计时推进
-    if winding_down_turns > 0 and not token_ended:
-        # 已在收尾模式但 Sophia 还没说 END_TOKEN → 推进计数
-        winding_down_turns += 1
-        print(f"[Backend] 收尾轮数推进至 {winding_down_turns}/{WINDING_DOWN_MAX}")
-    elif just_completed and winding_down_turns == 0:
-        # 三要素本轮刚达成（之前还没进收尾），从下一轮开始收尾
-        # （此轮 instructions 已经是 WINDING_DOWN，所以 winding_down_turns 设为 1）
-        winding_down_turns = 1
-        print(f"[Backend] 三要素达成，收尾倒计时启动（turns=1）")
-
-    # 7) 判断是否对话结束
-    ended = token_ended
-    if ended:
-        print("[Backend] conversation_ended=True（Sophia 发出了 END_TOKEN）")
-
-    reply_b64 = base64.b64encode(audio_reply).decode("utf-8") if audio_reply else ""
-    return SpeakResponse(
-        reply_pcm16_b64=reply_b64,
-        transcript=transcript,
-        user_transcript=user_text or "",
-        conversation_ended=ended,
-        progress_basic_situation=story_progress["basic_situation"],
-        progress_inner_conflict=story_progress["inner_conflict"],
-        progress_comforted=story_progress["comforted"],
-    )
 
 
 @app.post("/sophia/reset")
